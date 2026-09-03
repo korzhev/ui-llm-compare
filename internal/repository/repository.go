@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"io"
 	"strconv"
 
@@ -22,11 +23,27 @@ type IJobRepository interface {
 	Close() error
 }
 
+type IKafkaWriter interface {
+	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
+	Close() error
+}
+
+type IS3Client interface {
+	PutObject(
+		ctx context.Context,
+		bucketName string,
+		objectName string,
+		reader io.Reader,
+		objectSize int64,
+		opts minio.PutObjectOptions,
+	) (minio.UploadInfo, error)
+}
+
 type JobRepository struct {
 	DB      *sql.DB
-	S3      *minio.Client
+	S3      IS3Client
 	Bucket  string
-	KWriter *kafka.Writer
+	KWriter IKafkaWriter
 }
 
 func (d *JobRepository) GetByID(ctx context.Context, id int) (model.Job, error) {
@@ -64,12 +81,10 @@ func (d *JobRepository) CreateNew(ctx context.Context, origiKey string, currentS
 }
 
 func (d *JobRepository) Close() error {
-	errK := d.KWriter.Close()
-	errDb := d.DB.Close()
-	if errK != nil {
-		return errK
-	}
-	return errDb
+	return errors.Join(
+		d.KWriter.Close(),
+		d.DB.Close(),
+	)
 }
 
 func (d *JobRepository) SaveImg(ctx context.Context, key string, reader io.Reader, contentType string, size int64) error {

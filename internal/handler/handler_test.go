@@ -2,84 +2,384 @@ package handler
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/korzhev/ui-llm-compare/internal/logger"
+	"github.com/korzhev/ui-llm-compare/internal/model"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
-func TestRecieveImgsHandlerFunc(t *testing.T) {
-	tests := []struct {
-		name       string
-		fileSizes  []int
-		wantStatus int
-	}{
-		{
-			name:       "accepts two images",
-			fileSizes:  []int{1024, 2048},
-			wantStatus: http.StatusNoContent,
-		},
-		{
-			name:       "accepts two images at size limit",
-			fileSizes:  []int{maxImageSize, maxImageSize},
-			wantStatus: http.StatusNoContent,
-		},
-		{
-			name:       "rejects image over size limit",
-			fileSizes:  []int{maxImageSize + 1, 1024},
-			wantStatus: http.StatusRequestEntityTooLarge,
-		},
-		{
-			name:       "rejects one image",
-			fileSizes:  []int{1024},
-			wantStatus: http.StatusBadRequest,
-		},
-		{
-			name:       "rejects three images",
-			fileSizes:  []int{1024, 1024, 1024},
-			wantStatus: http.StatusBadRequest,
-		},
-	}
+type jobServiceMock struct {
+	getByIDFn          func(ctx context.Context, id int) (model.Job, error)
+	createNewFn        func(ctx context.Context, originKey string, currentStateKey string) (model.Job, error)
+	saveImgsParallelFn func(ctx context.Context, origin *multipart.FileHeader, current *multipart.FileHeader) (string, string, error)
+	sendMsgFn          func(ctx context.Context, id int, originKey, currentStateKey string) error
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var body bytes.Buffer
-			writer := multipart.NewWriter(&body)
-			for i, size := range tt.fileSizes {
-				part, err := writer.CreateFormFile("images", "image.jpg")
-				if err != nil {
-					t.Fatalf("create multipart file %d: %v", i, err)
-				}
-				if _, err := part.Write(bytes.Repeat([]byte{'a'}, size)); err != nil {
-					t.Fatalf("write multipart file %d: %v", i, err)
-				}
-			}
-			if err := writer.Close(); err != nil {
-				t.Fatalf("close multipart writer: %v", err)
-			}
-
-			req := httptest.NewRequest(http.MethodPost, "/api/compare", &body)
-			req.Header.Set("Content-Type", writer.FormDataContentType())
-			response := httptest.NewRecorder()
-
-			JobHandler{}.RecieveImgsHandlerFunc(response, req)
-
-			if response.Code != tt.wantStatus {
-				t.Errorf("status = %d, want %d; body = %q", response.Code, tt.wantStatus, response.Body.String())
-			}
-		})
-	}
+	getByIDCalls          int
+	createNewCalls        int
+	saveImgsParallelCalls int
+	sendMsgCalls          int
 }
 
-func TestRecieveImgsHandlerFuncRejectsInvalidMultipart(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/api/compare", strings.NewReader("not multipart"))
-	req.Header.Set("Content-Type", "text/plain")
+func (m *jobServiceMock) GetByID(ctx context.Context, id int) (model.Job, error) {
+	m.getByIDCalls++
+	if m.getByIDFn != nil {
+		return m.getByIDFn(ctx, id)
+	}
+	return model.Job{}, nil
+}
+
+func (m *jobServiceMock) CreateNew(ctx context.Context, originKey string, currentStateKey string) (model.Job, error) {
+	m.createNewCalls++
+	if m.createNewFn != nil {
+		return m.createNewFn(ctx, originKey, currentStateKey)
+	}
+	return model.Job{}, nil
+}
+
+func (m *jobServiceMock) SaveImg(context.Context, io.Reader, string, int64) (string, error) {
+	return "", nil
+}
+
+func (m *jobServiceMock) GetFileInfo(file *multipart.FileHeader) (string, int64) {
+	return file.Header.Get("Content-Type"), file.Size
+}
+
+func (m *jobServiceMock) SaveImgsParallel(
+	ctx context.Context,
+	origin *multipart.FileHeader,
+	current *multipart.FileHeader,
+) (string, string, error) {
+	m.saveImgsParallelCalls++
+	if m.saveImgsParallelFn != nil {
+		return m.saveImgsParallelFn(ctx, origin, current)
+	}
+	return "", "", nil
+}
+
+func (m *jobServiceMock) SendMsg(ctx context.Context, id int, originKey, currentStateKey string) error {
+	m.sendMsgCalls++
+	if m.sendMsgFn != nil {
+		return m.sendMsgFn(ctx, id, originKey, currentStateKey)
+	}
+	return nil
+}
+
+func setupTestLogger(t *testing.T) {
+	t.Helper()
+
+	previousLogger := logger.Log
+	logger.Log = zap.NewNop().Sugar()
+	t.Cleanup(func() {
+		logger.Log = previousLogger
+	})
+}
+
+func newMultipartRequest(t *testing.T, addParts func(writer *multipart.Writer)) *http.Request {
+	t.Helper()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	addParts(writer)
+	require.NoError(t, writer.Close())
+
+	request := httptest.NewRequest(http.MethodPost, "/api/compare", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	return request
+}
+
+func addMultipartFile(t *testing.T, writer *multipart.Writer, fieldName, filename string, data []byte) {
+	t.Helper()
+
+	part, err := writer.CreateFormFile(fieldName, filename)
+	require.NoError(t, err)
+	_, err = part.Write(data)
+	require.NoError(t, err)
+}
+
+func performGetJobStatusRequest(handler JobHandler, path string) *httptest.ResponseRecorder {
+	router := chi.NewRouter()
+	router.Get("/api/jobs/{id}", handler.GetJobStatusHandlerFunc)
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	return response
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_CreatesJob(t *testing.T) {
+	setupTestLogger(t)
+	service := &jobServiceMock{
+		saveImgsParallelFn: func(_ context.Context, origin *multipart.FileHeader, current *multipart.FileHeader) (string, string, error) {
+			require.NotNil(t, origin)
+			require.NotNil(t, current)
+			assert.Equal(t, "origin.png", origin.Filename)
+			assert.Equal(t, "current.png", current.Filename)
+			return "origin-key", "current-key", nil
+		},
+		createNewFn: func(_ context.Context, originKey string, currentStateKey string) (model.Job, error) {
+			assert.Equal(t, "origin-key", originKey)
+			assert.Equal(t, "current-key", currentStateKey)
+			return model.Job{ID: 42, Status: model.JobStatusCreated, IsEqual: false}, nil
+		},
+		sendMsgFn: func(_ context.Context, id int, originKey, currentStateKey string) error {
+			assert.Equal(t, 42, id)
+			assert.Equal(t, "origin-key", originKey)
+			assert.Equal(t, "current-key", currentStateKey)
+			return nil
+		},
+	}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", []byte("origin-image"))
+		addMultipartFile(t, writer, "current", "current.png", []byte("current-image"))
+	})
 	response := httptest.NewRecorder()
 
-	JobHandler{}.RecieveImgsHandlerFunc(response, req)
+	handler.RecieveImgsHandlerFunc(response, request)
 
-	if response.Code != http.StatusBadRequest {
-		t.Errorf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	assert.Equal(t, http.StatusCreated, response.Code)
+	assert.Equal(t, "application/json", response.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"id":42,"job_status":"created","is_equal":false}`, response.Body.String())
+	assert.Equal(t, 1, service.saveImgsParallelCalls)
+	assert.Equal(t, 1, service.createNewCalls)
+	assert.Equal(t, 1, service.sendMsgCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_RejectsInvalidMultipart(t *testing.T) {
+	setupTestLogger(t)
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+	request := httptest.NewRequest(http.MethodPost, "/api/compare", strings.NewReader("not multipart"))
+	request.Header.Set("Content-Type", "text/plain")
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "invalid multipart form\n", response.Body.String())
+	assert.Zero(t, service.saveImgsParallelCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_RejectsRequestOverLimit(t *testing.T) {
+	setupTestLogger(t)
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", bytes.Repeat([]byte("a"), maxRequestSize))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	assert.Equal(t, "request body is too large\n", response.Body.String())
+	assert.Zero(t, service.saveImgsParallelCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_RejectsOneImage(t *testing.T) {
+	setupTestLogger(t)
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", []byte("origin-image"))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "exactly two images are required\n", response.Body.String())
+	assert.Zero(t, service.saveImgsParallelCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_RejectsThreeImages(t *testing.T) {
+	setupTestLogger(t)
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", []byte("origin-image"))
+		addMultipartFile(t, writer, "current", "current.png", []byte("current-image"))
+		addMultipartFile(t, writer, "current", "extra.png", []byte("extra-image"))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "exactly two images are required\n", response.Body.String())
+	assert.Zero(t, service.saveImgsParallelCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_RejectsImageOverLimit(t *testing.T) {
+	setupTestLogger(t)
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", bytes.Repeat([]byte("a"), maxImageSize+1))
+		addMultipartFile(t, writer, "current", "current.png", []byte("current-image"))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
+	assert.Equal(t, "each image must not exceed 10 MiB\n", response.Body.String())
+	assert.Zero(t, service.saveImgsParallelCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSaveImagesError(t *testing.T) {
+	setupTestLogger(t)
+	serviceErr := errors.New("save images failed")
+	service := &jobServiceMock{
+		saveImgsParallelFn: func(context.Context, *multipart.FileHeader, *multipart.FileHeader) (string, string, error) {
+			return "", "", serviceErr
+		},
 	}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", []byte("origin-image"))
+		addMultipartFile(t, writer, "current", "current.png", []byte("current-image"))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.Equal(t, "save images failed\n", response.Body.String())
+	assert.Equal(t, 1, service.saveImgsParallelCalls)
+	assert.Zero(t, service.createNewCalls)
+	assert.Zero(t, service.sendMsgCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_ReturnsCreateJobError(t *testing.T) {
+	setupTestLogger(t)
+	serviceErr := errors.New("create job failed")
+	service := &jobServiceMock{
+		saveImgsParallelFn: func(context.Context, *multipart.FileHeader, *multipart.FileHeader) (string, string, error) {
+			return "origin-key", "current-key", nil
+		},
+		createNewFn: func(context.Context, string, string) (model.Job, error) {
+			return model.Job{}, serviceErr
+		},
+	}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", []byte("origin-image"))
+		addMultipartFile(t, writer, "current", "current.png", []byte("current-image"))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.Equal(t, "create job failed\n", response.Body.String())
+	assert.Equal(t, 1, service.saveImgsParallelCalls)
+	assert.Equal(t, 1, service.createNewCalls)
+	assert.Zero(t, service.sendMsgCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSendMessageError(t *testing.T) {
+	setupTestLogger(t)
+	serviceErr := errors.New("send message failed")
+	service := &jobServiceMock{
+		saveImgsParallelFn: func(context.Context, *multipart.FileHeader, *multipart.FileHeader) (string, string, error) {
+			return "origin-key", "current-key", nil
+		},
+		createNewFn: func(context.Context, string, string) (model.Job, error) {
+			return model.Job{ID: 42, Status: model.JobStatusCreated}, nil
+		},
+		sendMsgFn: func(context.Context, int, string, string) error {
+			return serviceErr
+		},
+	}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", []byte("origin-image"))
+		addMultipartFile(t, writer, "current", "current.png", []byte("current-image"))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.Equal(t, "send message failed\n", response.Body.String())
+	assert.Equal(t, 1, service.saveImgsParallelCalls)
+	assert.Equal(t, 1, service.createNewCalls)
+	assert.Equal(t, 1, service.sendMsgCalls)
+}
+
+func TestJobHandler_GetJobStatusHandlerFunc_ReturnsJobStatus(t *testing.T) {
+	service := &jobServiceMock{
+		getByIDFn: func(_ context.Context, id int) (model.Job, error) {
+			assert.Equal(t, 42, id)
+			return model.Job{ID: 42, Status: model.JobStatusDone, IsEqual: true}, nil
+		},
+	}
+	handler := JobHandler{JS: service}
+
+	response := performGetJobStatusRequest(handler, "/api/jobs/42")
+
+	assert.Equal(t, http.StatusCreated, response.Code)
+	assert.Equal(t, "application/json", response.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"id":42,"job_status":"done","is_equal":true}`, response.Body.String())
+	assert.Equal(t, 1, service.getByIDCalls)
+}
+
+func TestJobHandler_GetJobStatusHandlerFunc_RejectsNonNumericID(t *testing.T) {
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+
+	response := performGetJobStatusRequest(handler, "/api/jobs/not-a-number")
+
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "Invalid id\n", response.Body.String())
+	assert.Zero(t, service.getByIDCalls)
+}
+
+func TestJobHandler_GetJobStatusHandlerFunc_RejectsZeroID(t *testing.T) {
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+
+	response := performGetJobStatusRequest(handler, "/api/jobs/0")
+
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "Invalid id\n", response.Body.String())
+	assert.Zero(t, service.getByIDCalls)
+}
+
+func TestJobHandler_GetJobStatusHandlerFunc_RejectsNegativeID(t *testing.T) {
+	service := &jobServiceMock{}
+	handler := JobHandler{JS: service}
+
+	response := performGetJobStatusRequest(handler, "/api/jobs/-5")
+
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "Invalid id\n", response.Body.String())
+	assert.Zero(t, service.getByIDCalls)
+}
+
+func TestJobHandler_GetJobStatusHandlerFunc_ReturnsServiceError(t *testing.T) {
+	serviceErr := errors.New("get job failed")
+	service := &jobServiceMock{
+		getByIDFn: func(context.Context, int) (model.Job, error) {
+			return model.Job{}, serviceErr
+		},
+	}
+	handler := JobHandler{JS: service}
+
+	response := performGetJobStatusRequest(handler, "/api/jobs/42")
+
+	assert.Equal(t, http.StatusInternalServerError, response.Code)
+	assert.Equal(t, "get job failed\n", response.Body.String())
+	assert.Equal(t, 1, service.getByIDCalls)
 }
