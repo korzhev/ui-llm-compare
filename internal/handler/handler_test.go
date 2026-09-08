@@ -24,11 +24,15 @@ type jobServiceMock struct {
 	createNewFn        func(ctx context.Context, originKey string, currentStateKey string) (model.Job, error)
 	saveImgsParallelFn func(ctx context.Context, origin model.FormFile, current model.FormFile) (string, string, error)
 	sendMsgFn          func(ctx context.Context, id int, originKey, currentStateKey string) error
+	rollbackJobFn      func(ctx context.Context, id int) (model.Job, error)
+	rollbackImgsFn     func(ctx context.Context, originKey, currentStateKey string) error
 
 	getByIDCalls          int
 	createNewCalls        int
 	saveImgsParallelCalls int
 	sendMsgCalls          int
+	rollbackJobCalls      int
+	rollbackImgsCalls     int
 }
 
 func (m *jobServiceMock) GetByID(ctx context.Context, id int) (model.Job, error) {
@@ -65,6 +69,22 @@ func (m *jobServiceMock) SendMsg(ctx context.Context, id int, originKey, current
 	m.sendMsgCalls++
 	if m.sendMsgFn != nil {
 		return m.sendMsgFn(ctx, id, originKey, currentStateKey)
+	}
+	return nil
+}
+
+func (m *jobServiceMock) RollbackJob(ctx context.Context, id int) (model.Job, error) {
+	m.rollbackJobCalls++
+	if m.rollbackJobFn != nil {
+		return m.rollbackJobFn(ctx, id)
+	}
+	return model.Job{}, nil
+}
+
+func (m *jobServiceMock) RollbackImgs(ctx context.Context, originKey, currentStateKey string) error {
+	m.rollbackImgsCalls++
+	if m.rollbackImgsFn != nil {
+		return m.rollbackImgsFn(ctx, originKey, currentStateKey)
 	}
 	return nil
 }
@@ -256,7 +276,7 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSaveImagesError(t *testing.T) 
 	handler.RecieveImgsHandlerFunc(response, request)
 
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
-	assert.Equal(t, "save images failed\n", response.Body.String())
+	assert.Equal(t, "Images saving error\n", response.Body.String())
 	assert.Equal(t, 1, service.saveImgsParallelCalls)
 	assert.Zero(t, service.createNewCalls)
 	assert.Zero(t, service.sendMsgCalls)
@@ -272,6 +292,11 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsCreateJobError(t *testing.T) {
 		createNewFn: func(context.Context, string, string) (model.Job, error) {
 			return model.Job{}, serviceErr
 		},
+		rollbackImgsFn: func(_ context.Context, originKey, currentStateKey string) error {
+			assert.Equal(t, "origin-key", originKey)
+			assert.Equal(t, "current-key", currentStateKey)
+			return nil
+		},
 	}
 	handler := JobHandler{JS: service}
 	request := newMultipartRequest(t, func(writer *multipart.Writer) {
@@ -283,13 +308,14 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsCreateJobError(t *testing.T) {
 	handler.RecieveImgsHandlerFunc(response, request)
 
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
-	assert.Equal(t, "create job failed\n", response.Body.String())
+	assert.Equal(t, "Creating job error\n", response.Body.String())
 	assert.Equal(t, 1, service.saveImgsParallelCalls)
 	assert.Equal(t, 1, service.createNewCalls)
 	assert.Zero(t, service.sendMsgCalls)
+	assert.Equal(t, 1, service.rollbackImgsCalls)
 }
 
-func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSendMessageError(t *testing.T) {
+func TestJobHandler_RecieveImgsHandlerFunc_MarksJobFailedWhenSendingMessageFails(t *testing.T) {
 	setupTestLogger(t)
 	serviceErr := errors.New("send message failed")
 	service := &jobServiceMock{
@@ -302,6 +328,44 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSendMessageError(t *testing.T)
 		sendMsgFn: func(context.Context, int, string, string) error {
 			return serviceErr
 		},
+		rollbackJobFn: func(_ context.Context, id int) (model.Job, error) {
+			assert.Equal(t, 42, id)
+			return model.Job{ID: id}, nil
+		},
+	}
+	handler := JobHandler{JS: service}
+	request := newMultipartRequest(t, func(writer *multipart.Writer) {
+		addMultipartFile(t, writer, "origin", "origin.png", []byte("origin-image"))
+		addMultipartFile(t, writer, "current", "current.png", []byte("current-image"))
+	})
+	response := httptest.NewRecorder()
+
+	handler.RecieveImgsHandlerFunc(response, request)
+
+	assert.Equal(t, http.StatusCreated, response.Code)
+	assert.Equal(t, "application/json", response.Header().Get("Content-Type"))
+	assert.JSONEq(t, `{"id":42,"job_status":"failed","is_equal":false}`, response.Body.String())
+	assert.Equal(t, 1, service.saveImgsParallelCalls)
+	assert.Equal(t, 1, service.createNewCalls)
+	assert.Equal(t, 1, service.sendMsgCalls)
+	assert.Equal(t, 1, service.rollbackJobCalls)
+}
+
+func TestJobHandler_RecieveImgsHandlerFunc_ReturnsErrorWhenJobRollbackFails(t *testing.T) {
+	setupTestLogger(t)
+	service := &jobServiceMock{
+		saveImgsParallelFn: func(context.Context, model.FormFile, model.FormFile) (string, string, error) {
+			return "origin-key", "current-key", nil
+		},
+		createNewFn: func(context.Context, string, string) (model.Job, error) {
+			return model.Job{ID: 42, Status: model.JobStatusCreated}, nil
+		},
+		sendMsgFn: func(context.Context, int, string, string) error {
+			return errors.New("send message failed")
+		},
+		rollbackJobFn: func(context.Context, int) (model.Job, error) {
+			return model.Job{}, errors.New("rollback job failed")
+		},
 	}
 	handler := JobHandler{JS: service}
 	request := newMultipartRequest(t, func(writer *multipart.Writer) {
@@ -313,10 +377,8 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSendMessageError(t *testing.T)
 	handler.RecieveImgsHandlerFunc(response, request)
 
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
-	assert.Equal(t, "send message failed\n", response.Body.String())
-	assert.Equal(t, 1, service.saveImgsParallelCalls)
-	assert.Equal(t, 1, service.createNewCalls)
-	assert.Equal(t, 1, service.sendMsgCalls)
+	assert.Equal(t, "Msg sending error\n", response.Body.String())
+	assert.Equal(t, 1, service.rollbackJobCalls)
 }
 
 func TestJobHandler_GetJobStatusHandlerFunc_ReturnsJobStatus(t *testing.T) {
@@ -370,6 +432,7 @@ func TestJobHandler_GetJobStatusHandlerFunc_RejectsNegativeID(t *testing.T) {
 }
 
 func TestJobHandler_GetJobStatusHandlerFunc_ReturnsServiceError(t *testing.T) {
+	setupTestLogger(t)
 	serviceErr := errors.New("get job failed")
 	service := &jobServiceMock{
 		getByIDFn: func(context.Context, int) (model.Job, error) {
@@ -381,6 +444,6 @@ func TestJobHandler_GetJobStatusHandlerFunc_ReturnsServiceError(t *testing.T) {
 	response := performGetJobStatusRequest(handler, "/api/jobs/42")
 
 	assert.Equal(t, http.StatusInternalServerError, response.Code)
-	assert.Equal(t, "get job failed\n", response.Body.String())
+	assert.Equal(t, "Get job error\n", response.Body.String())
 	assert.Equal(t, 1, service.getByIDCalls)
 }

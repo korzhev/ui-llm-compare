@@ -29,6 +29,8 @@ type jobRepositoryMock struct {
 	createNewFn func(ctx context.Context, originKey string, currentStateKey string) (model.Job, error)
 	saveImgFn   func(ctx context.Context, key string, reader io.Reader, contentType string, size int64) error
 	sendMsgFn   func(ctx context.Context, id int, value model.JobKafkaMsg) error
+	failJobFn   func(ctx context.Context, id int) error
+	deleteImgFn func(ctx context.Context, key string) error
 
 	saveImgCalls []saveImgCall
 }
@@ -67,9 +69,25 @@ func (m *jobRepositoryMock) SendMsg(ctx context.Context, id int, value model.Job
 	return m.sendMsgFn(ctx, id, value)
 }
 
+func (m *jobRepositoryMock) FailJob(ctx context.Context, id int) error {
+	if m.failJobFn != nil {
+		return m.failJobFn(ctx, id)
+	}
+	return nil
+}
+
+func (m *jobRepositoryMock) DeleteImg(ctx context.Context, key string) error {
+	if m.deleteImgFn != nil {
+		return m.deleteImgFn(ctx, key)
+	}
+	return nil
+}
+
 func (m *jobRepositoryMock) Close() error {
 	return nil
 }
+
+var _ JobRepository = (*jobRepositoryMock)(nil)
 
 func (m *jobRepositoryMock) getSaveImgCalls() []saveImgCall {
 	m.mu.Lock()
@@ -301,4 +319,112 @@ func TestJobService_SendMsg_ReturnsRepositoryError(t *testing.T) {
 	err := service.SendMsg(context.Background(), 7, "origin-key", "current-key")
 
 	require.ErrorIs(t, err, repoErr)
+}
+
+func TestJobService_RollbackImgs_DeletesBothImages(t *testing.T) {
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("request-id"), "request-42")
+	var deletedKeys []string
+	repo := &jobRepositoryMock{
+		deleteImgFn: func(actualCtx context.Context, key string) error {
+			assert.Equal(t, "request-42", actualCtx.Value(contextKey("request-id")))
+			deletedKeys = append(deletedKeys, key)
+			return nil
+		},
+	}
+	service := JobService{Repo: repo}
+
+	err := service.RollbackImgs(ctx, "origin-key", "current-key")
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"origin-key", "current-key"}, deletedKeys)
+}
+
+func TestJobService_RollbackImgs_JoinsDeleteErrors(t *testing.T) {
+	originErr := errors.New("delete origin failed")
+	currentErr := errors.New("delete current failed")
+	repo := &jobRepositoryMock{
+		deleteImgFn: func(_ context.Context, key string) error {
+			switch key {
+			case "origin-key":
+				return originErr
+			case "current-key":
+				return currentErr
+			default:
+				return nil
+			}
+		},
+	}
+	service := JobService{Repo: repo}
+
+	err := service.RollbackImgs(context.Background(), "origin-key", "current-key")
+
+	require.ErrorIs(t, err, originErr)
+	require.ErrorIs(t, err, currentErr)
+}
+
+func TestJobService_RollbackJob_DeletesImagesAndFailsJob(t *testing.T) {
+	expectedJob := model.Job{
+		ID:              42,
+		OriginKey:       "origin-key",
+		CurrentStateKey: "current-key",
+		Status:          model.JobStatusCreated,
+	}
+	var calls []string
+	repo := &jobRepositoryMock{
+		getByIDFn: func(_ context.Context, id int) (model.Job, error) {
+			assert.Equal(t, 42, id)
+			calls = append(calls, "get")
+			return expectedJob, nil
+		},
+		deleteImgFn: func(_ context.Context, key string) error {
+			calls = append(calls, "delete:"+key)
+			return nil
+		},
+		failJobFn: func(_ context.Context, id int) error {
+			assert.Equal(t, 42, id)
+			calls = append(calls, "fail")
+			return nil
+		},
+	}
+	service := JobService{Repo: repo}
+
+	job, err := service.RollbackJob(context.Background(), 42)
+
+	require.NoError(t, err)
+	assert.Equal(t, expectedJob, job)
+	assert.Equal(t, []string{
+		"get",
+		"delete:origin-key",
+		"delete:current-key",
+		"fail",
+	}, calls)
+}
+
+func TestJobService_RollbackJob_GetErrorSkipsImagesAndFailsJob(t *testing.T) {
+	getErr := errors.New("get job failed")
+	failErr := errors.New("fail job failed")
+	expectedJob := model.Job{ID: 42}
+	deleteCalled := false
+	repo := &jobRepositoryMock{
+		getByIDFn: func(context.Context, int) (model.Job, error) {
+			return expectedJob, getErr
+		},
+		deleteImgFn: func(context.Context, string) error {
+			deleteCalled = true
+			return nil
+		},
+		failJobFn: func(_ context.Context, id int) error {
+			assert.Equal(t, 42, id)
+			return failErr
+		},
+	}
+	service := JobService{Repo: repo}
+
+	job, err := service.RollbackJob(context.Background(), 42)
+
+	assert.Equal(t, expectedJob, job)
+	require.ErrorIs(t, err, getErr)
+	require.ErrorIs(t, err, failErr)
+	assert.False(t, deleteCalled)
 }

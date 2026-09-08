@@ -28,7 +28,9 @@ type s3ClientMock struct {
 	reader     io.Reader
 	objectSize int64
 	opts       minio.PutObjectOptions
-	err        error
+	removeOpts minio.RemoveObjectOptions
+	putErr     error
+	removeErr  error
 }
 
 func (m *s3ClientMock) PutObject(
@@ -45,7 +47,20 @@ func (m *s3ClientMock) PutObject(
 	m.objectSize = objectSize
 	m.opts = opts
 
-	return minio.UploadInfo{}, m.err
+	return minio.UploadInfo{}, m.putErr
+}
+
+func (m *s3ClientMock) RemoveObject(
+	_ context.Context,
+	bucketName string,
+	objectName string,
+	opts minio.RemoveObjectOptions,
+) error {
+	m.bucketName = bucketName
+	m.objectName = objectName
+	m.removeOpts = opts
+
+	return m.removeErr
 }
 
 type kafkaWriterMock struct {
@@ -201,10 +216,32 @@ func TestJobRepository_SaveImg_UploadsImage(t *testing.T) {
 
 func TestJobRepository_SaveImg_ReturnsS3Error(t *testing.T) {
 	s3Err := errors.New("s3 upload failed")
-	s3 := &s3ClientMock{err: s3Err}
+	s3 := &s3ClientMock{putErr: s3Err}
 	repository := &JobRepository{S3: s3, Bucket: "screenshots"}
 
 	err := repository.SaveImg(context.Background(), "origin.png", strings.NewReader("data"), "image/png", 4)
+
+	require.ErrorIs(t, err, s3Err)
+}
+
+func TestJobRepository_DeleteImg_DeletesImage(t *testing.T) {
+	s3 := &s3ClientMock{}
+	repository := &JobRepository{S3: s3, Bucket: "screenshots"}
+
+	err := repository.DeleteImg(context.Background(), "jobs/42/origin.png")
+
+	require.NoError(t, err)
+	assert.Equal(t, "screenshots", s3.bucketName)
+	assert.Equal(t, "jobs/42/origin.png", s3.objectName)
+	assert.Equal(t, minio.RemoveObjectOptions{}, s3.removeOpts)
+}
+
+func TestJobRepository_DeleteImg_ReturnsS3Error(t *testing.T) {
+	s3Err := errors.New("s3 delete failed")
+	s3 := &s3ClientMock{removeErr: s3Err}
+	repository := &JobRepository{S3: s3, Bucket: "screenshots"}
+
+	err := repository.DeleteImg(context.Background(), "origin.png")
 
 	require.ErrorIs(t, err, s3Err)
 }
