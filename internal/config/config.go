@@ -29,19 +29,18 @@ type Config struct {
 	Kafka         KafkaConfig `json:"kafka"`
 }
 
-var Conf Config
-
-func ParseConfig(name string) error {
+func ParseConfig(name string) (Config, error) {
+	var c Config
 	f, e := os.Open(name)
 	if e != nil {
-		return e
+		return c, e
 	}
 	defer f.Close()
 
 	decoder := json.NewDecoder(f)
-	if e := decoder.Decode(&Conf); e != nil {
-		return e
+	if e := decoder.Decode(&c); e != nil {
+		return c, e
 	}
 
-	return nil
+	return c, nil
 }

@@ -22,7 +22,7 @@ import (
 type jobServiceMock struct {
 	getByIDFn          func(ctx context.Context, id int) (model.Job, error)
 	createNewFn        func(ctx context.Context, originKey string, currentStateKey string) (model.Job, error)
-	saveImgsParallelFn func(ctx context.Context, origin *multipart.FileHeader, current *multipart.FileHeader) (string, string, error)
+	saveImgsParallelFn func(ctx context.Context, origin model.FormFile, current model.FormFile) (string, string, error)
 	sendMsgFn          func(ctx context.Context, id int, originKey, currentStateKey string) error
 
 	getByIDCalls          int
@@ -47,18 +47,10 @@ func (m *jobServiceMock) CreateNew(ctx context.Context, originKey string, curren
 	return model.Job{}, nil
 }
 
-func (m *jobServiceMock) SaveImg(context.Context, io.Reader, string, int64) (string, error) {
-	return "", nil
-}
-
-func (m *jobServiceMock) GetFileInfo(file *multipart.FileHeader) (string, int64) {
-	return file.Header.Get("Content-Type"), file.Size
-}
-
 func (m *jobServiceMock) SaveImgsParallel(
 	ctx context.Context,
-	origin *multipart.FileHeader,
-	current *multipart.FileHeader,
+	origin model.FormFile,
+	current model.FormFile,
 ) (string, string, error) {
 	m.saveImgsParallelCalls++
 	if m.saveImgsParallelFn != nil {
@@ -66,6 +58,8 @@ func (m *jobServiceMock) SaveImgsParallel(
 	}
 	return "", "", nil
 }
+
+var _ JobService = (*jobServiceMock)(nil)
 
 func (m *jobServiceMock) SendMsg(ctx context.Context, id int, originKey, currentStateKey string) error {
 	m.sendMsgCalls++
@@ -119,11 +113,18 @@ func performGetJobStatusRequest(handler JobHandler, path string) *httptest.Respo
 func TestJobHandler_RecieveImgsHandlerFunc_CreatesJob(t *testing.T) {
 	setupTestLogger(t)
 	service := &jobServiceMock{
-		saveImgsParallelFn: func(_ context.Context, origin *multipart.FileHeader, current *multipart.FileHeader) (string, string, error) {
-			require.NotNil(t, origin)
-			require.NotNil(t, current)
-			assert.Equal(t, "origin.png", origin.Filename)
-			assert.Equal(t, "current.png", current.Filename)
+		saveImgsParallelFn: func(_ context.Context, origin model.FormFile, current model.FormFile) (string, string, error) {
+			assert.Equal(t, int64(len("origin-image")), origin.Size)
+			assert.Equal(t, "application/octet-stream", origin.ContentType)
+			assert.Equal(t, int64(len("current-image")), current.Size)
+			assert.Equal(t, "application/octet-stream", current.ContentType)
+
+			originData, err := io.ReadAll(origin.File)
+			require.NoError(t, err)
+			currentData, err := io.ReadAll(current.File)
+			require.NoError(t, err)
+			assert.Equal(t, "origin-image", string(originData))
+			assert.Equal(t, "current-image", string(currentData))
 			return "origin-key", "current-key", nil
 		},
 		createNewFn: func(_ context.Context, originKey string, currentStateKey string) (model.Job, error) {
@@ -186,7 +187,7 @@ func TestJobHandler_RecieveImgsHandlerFunc_RejectsRequestOverLimit(t *testing.T)
 	assert.Zero(t, service.saveImgsParallelCalls)
 }
 
-func TestJobHandler_RecieveImgsHandlerFunc_RejectsOneImage(t *testing.T) {
+func TestJobHandler_RecieveImgsHandlerFunc_RejectsMissingCurrentImage(t *testing.T) {
 	setupTestLogger(t)
 	service := &jobServiceMock{}
 	handler := JobHandler{JS: service}
@@ -198,7 +199,7 @@ func TestJobHandler_RecieveImgsHandlerFunc_RejectsOneImage(t *testing.T) {
 	handler.RecieveImgsHandlerFunc(response, request)
 
 	assert.Equal(t, http.StatusBadRequest, response.Code)
-	assert.Equal(t, "exactly two images are required\n", response.Body.String())
+	assert.Equal(t, "http: no such file\n", response.Body.String())
 	assert.Zero(t, service.saveImgsParallelCalls)
 }
 
@@ -232,8 +233,8 @@ func TestJobHandler_RecieveImgsHandlerFunc_RejectsImageOverLimit(t *testing.T) {
 
 	handler.RecieveImgsHandlerFunc(response, request)
 
-	assert.Equal(t, http.StatusRequestEntityTooLarge, response.Code)
-	assert.Equal(t, "each image must not exceed 10 MiB\n", response.Body.String())
+	assert.Equal(t, http.StatusBadRequest, response.Code)
+	assert.Equal(t, "File: origin is too large\n", response.Body.String())
 	assert.Zero(t, service.saveImgsParallelCalls)
 }
 
@@ -241,7 +242,7 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSaveImagesError(t *testing.T) 
 	setupTestLogger(t)
 	serviceErr := errors.New("save images failed")
 	service := &jobServiceMock{
-		saveImgsParallelFn: func(context.Context, *multipart.FileHeader, *multipart.FileHeader) (string, string, error) {
+		saveImgsParallelFn: func(context.Context, model.FormFile, model.FormFile) (string, string, error) {
 			return "", "", serviceErr
 		},
 	}
@@ -265,7 +266,7 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsCreateJobError(t *testing.T) {
 	setupTestLogger(t)
 	serviceErr := errors.New("create job failed")
 	service := &jobServiceMock{
-		saveImgsParallelFn: func(context.Context, *multipart.FileHeader, *multipart.FileHeader) (string, string, error) {
+		saveImgsParallelFn: func(context.Context, model.FormFile, model.FormFile) (string, string, error) {
 			return "origin-key", "current-key", nil
 		},
 		createNewFn: func(context.Context, string, string) (model.Job, error) {
@@ -292,7 +293,7 @@ func TestJobHandler_RecieveImgsHandlerFunc_ReturnsSendMessageError(t *testing.T)
 	setupTestLogger(t)
 	serviceErr := errors.New("send message failed")
 	service := &jobServiceMock{
-		saveImgsParallelFn: func(context.Context, *multipart.FileHeader, *multipart.FileHeader) (string, string, error) {
+		saveImgsParallelFn: func(context.Context, model.FormFile, model.FormFile) (string, string, error) {
 			return "origin-key", "current-key", nil
 		},
 		createNewFn: func(context.Context, string, string) (model.Job, error) {

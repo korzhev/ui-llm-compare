@@ -37,27 +37,27 @@ func RootRouter(c config.Config, repo *repository.JobRepository) chi.Router {
 }
 
 func main() {
-	err := config.ParseConfig("config.json")
+	c, err := config.ParseConfig("config.json")
 	if err != nil {
 		logger.Log.Errorf("Error starting server: %s\n", err)
 		return
 	}
-	logger.InitLogger(config.Conf.LogLevel)
+	logger.InitLogger(c.LogLevel)
 	defer logger.Log.Sync()
-	if err := deps.InitDBSchema(config.Conf.DBDSN); err != nil {
+	if err := deps.InitDBSchema(c.DBDSN); err != nil {
 		logger.Log.Fatalw(
 			"Failed to apply database migrations",
 			"error", err,
 		)
 	}
-	if err := deps.InitBucket(config.Conf.S3); err != nil {
+	if err := deps.InitBucket(c.S3); err != nil {
 		logger.Log.Fatalw(
 			"Failed to create bucket",
 			"error", err,
 		)
 	}
 
-	if err := deps.InitKafkaTopic(config.Conf.Kafka); err != nil {
+	if err := deps.InitKafkaTopic(c.Kafka); err != nil {
 		logger.Log.Fatalw(
 			"Failed to create kafka topic",
 			"error", err,
@@ -65,10 +65,10 @@ func main() {
 	}
 
 	logger.Log.Infow("Server starting with params",
-		"address", config.Conf.ServerAddress,
+		"address", c.ServerAddress,
 	)
 
-	repo, err := repository.NewJobRepository(config.Conf.DBDSN, config.Conf.S3, config.Conf.Kafka)
+	repo, err := repository.NewJobRepository(c.DBDSN, c.S3, c.Kafka)
 	if err != nil {
 		logger.Log.Fatalw(
 			"Failed to create repository",
@@ -77,10 +77,10 @@ func main() {
 	}
 	defer repo.Close()
 
-	r := RootRouter(config.Conf, repo)
-	err = http.ListenAndServe(config.Conf.ServerAddress, r)
+	r := RootRouter(c, repo)
+	err = http.ListenAndServe(c.ServerAddress, r)
 	if err != nil {
 		logger.Log.Errorf("Error starting server: %s\n", err)
 	}
-	logger.Log.Infof("Server is running on: %s", config.Conf.ServerAddress)
+	logger.Log.Infof("Server is running on: %s", c.ServerAddress)
 }

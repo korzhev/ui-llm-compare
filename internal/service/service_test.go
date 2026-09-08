@@ -4,10 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"mime/multipart"
-	"net/textproto"
 	"sync"
 	"testing"
 
@@ -83,31 +80,12 @@ func (m *jobRepositoryMock) getSaveImgCalls() []saveImgCall {
 	return calls
 }
 
-func newMultipartFileHeader(t *testing.T, filename, contentType, content string) *multipart.FileHeader {
-	t.Helper()
-
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	header := make(textproto.MIMEHeader)
-	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="images"; filename="%s"`, filename))
-	if contentType != "" {
-		header.Set("Content-Type", contentType)
+func newFormFile(contentType, content string) model.FormFile {
+	return model.FormFile{
+		Size:        int64(len(content)),
+		ContentType: contentType,
+		File:        bytes.NewBufferString(content),
 	}
-	part, err := writer.CreatePart(header)
-	require.NoError(t, err)
-	_, err = part.Write([]byte(content))
-	require.NoError(t, err)
-	require.NoError(t, writer.Close())
-
-	form, err := multipart.NewReader(&body, writer.Boundary()).ReadForm(1 << 20)
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		require.NoError(t, form.RemoveAll())
-	})
-
-	files := form.File["images"]
-	require.Len(t, files, 1)
-	return files[0]
 }
 
 func findSaveImgCallByData(t *testing.T, calls []saveImgCall, data string) saveImgCall {
@@ -194,15 +172,14 @@ func TestJobService_CreateNew_ReturnsRepositoryError(t *testing.T) {
 	assert.Equal(t, model.Job{}, job)
 }
 
-func TestJobService_SaveImg_GeneratesUUIDAndSavesImage(t *testing.T) {
+func TestJobService_SaveImg_SavesImageWithProvidedKey(t *testing.T) {
 	repo := &jobRepositoryMock{}
 	service := JobService{Repo: repo}
 	reader := bytes.NewBufferString("image-data")
+	key := uuid.NewString()
 
-	key, err := service.SaveImg(context.Background(), reader, "image/png", 10)
+	err := service.SaveImg(context.Background(), reader, "image/png", 10, key)
 
-	require.NoError(t, err)
-	_, err = uuid.Parse(key)
 	require.NoError(t, err)
 	calls := repo.getSaveImgCalls()
 	require.Len(t, calls, 1)
@@ -212,7 +189,7 @@ func TestJobService_SaveImg_GeneratesUUIDAndSavesImage(t *testing.T) {
 	assert.Equal(t, int64(10), calls[0].size)
 }
 
-func TestJobService_SaveImg_ReturnsRepositoryErrorWithoutKey(t *testing.T) {
+func TestJobService_SaveImg_ReturnsRepositoryError(t *testing.T) {
 	repoErr := errors.New("save image failed")
 	repo := &jobRepositoryMock{
 		saveImgFn: func(context.Context, string, io.Reader, string, int64) error {
@@ -221,47 +198,39 @@ func TestJobService_SaveImg_ReturnsRepositoryErrorWithoutKey(t *testing.T) {
 	}
 	service := JobService{Repo: repo}
 
-	key, err := service.SaveImg(context.Background(), bytes.NewBufferString("data"), "image/jpeg", 4)
+	err := service.SaveImg(context.Background(), bytes.NewBufferString("data"), "image/jpeg", 4, "image-key")
 
 	require.ErrorIs(t, err, repoErr)
-	assert.Empty(t, key)
-	require.Len(t, repo.getSaveImgCalls(), 1)
+	calls := repo.getSaveImgCalls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "image-key", calls[0].key)
 }
 
-func TestJobService_GetFileInfo_ReturnsContentTypeAndSize(t *testing.T) {
-	fileHeader := &multipart.FileHeader{
-		Header: textproto.MIMEHeader{"Content-Type": []string{"image/webp"}},
-		Size:   128,
-	}
-	service := JobService{}
+func TestJobService_SaveImg_UsesDefaultContentType(t *testing.T) {
+	repo := &jobRepositoryMock{}
+	service := JobService{Repo: repo}
 
-	contentType, size := service.GetFileInfo(fileHeader)
+	err := service.SaveImg(context.Background(), bytes.NewBufferString("data"), "", 4, "image-key")
 
-	assert.Equal(t, "image/webp", contentType)
-	assert.Equal(t, int64(128), size)
-}
-
-func TestJobService_GetFileInfo_UsesDefaultContentType(t *testing.T) {
-	fileHeader := &multipart.FileHeader{Header: make(textproto.MIMEHeader), Size: 64}
-	service := JobService{}
-
-	contentType, size := service.GetFileInfo(fileHeader)
-
-	assert.Equal(t, "application/octet-stream", contentType)
-	assert.Equal(t, int64(64), size)
+	require.NoError(t, err)
+	calls := repo.getSaveImgCalls()
+	require.Len(t, calls, 1)
+	assert.Equal(t, "application/octet-stream", calls[0].contentType)
 }
 
 func TestJobService_SaveImgsParallel_SavesBothImages(t *testing.T) {
-	originFile := newMultipartFileHeader(t, "origin.png", "image/png", "origin-data")
-	currentFile := newMultipartFileHeader(t, "current.jpeg", "image/jpeg", "current-data")
+	originFile := newFormFile("image/png", "origin-data")
+	currentFile := newFormFile("image/jpeg", "current-data")
 	repo := &jobRepositoryMock{}
 	service := JobService{Repo: repo}
 
 	originKey, currentKey, err := service.SaveImgsParallel(context.Background(), originFile, currentFile)
 
 	require.NoError(t, err)
-	assert.NotEmpty(t, originKey)
-	assert.NotEmpty(t, currentKey)
+	_, parseOriginErr := uuid.Parse(originKey)
+	require.NoError(t, parseOriginErr)
+	_, parseCurrentErr := uuid.Parse(currentKey)
+	require.NoError(t, parseCurrentErr)
 	assert.NotEqual(t, originKey, currentKey)
 	calls := repo.getSaveImgCalls()
 	require.Len(t, calls, 2)
@@ -275,30 +244,9 @@ func TestJobService_SaveImgsParallel_SavesBothImages(t *testing.T) {
 	assert.Equal(t, int64(len("current-data")), currentCall.size)
 }
 
-func TestJobService_SaveImgsParallel_ReturnsFileOpenError(t *testing.T) {
-	invalidOriginFile := &multipart.FileHeader{
-		Filename: "missing.png",
-		Header:   textproto.MIMEHeader{"Content-Type": []string{"image/png"}},
-		Size:     12,
-	}
-	currentFile := newMultipartFileHeader(t, "current.png", "image/png", "current-data")
-	repo := &jobRepositoryMock{}
-	service := JobService{Repo: repo}
-
-	originKey, currentKey, err := service.SaveImgsParallel(context.Background(), invalidOriginFile, currentFile)
-
-	require.Error(t, err)
-	assert.Empty(t, originKey)
-	assert.NotEmpty(t, currentKey)
-	calls := repo.getSaveImgCalls()
-	require.Len(t, calls, 1)
-	assert.Equal(t, "current-data", calls[0].data)
-	assert.Equal(t, currentKey, calls[0].key)
-}
-
 func TestJobService_SaveImgsParallel_ReturnsRepositoryError(t *testing.T) {
-	originFile := newMultipartFileHeader(t, "origin.png", "image/png", "origin-data")
-	currentFile := newMultipartFileHeader(t, "current.png", "image/png", "current-data")
+	originFile := newFormFile("image/png", "origin-data")
+	currentFile := newFormFile("image/png", "current-data")
 	repoErr := errors.New("origin upload failed")
 	repo := &jobRepositoryMock{
 		saveImgFn: func(_ context.Context, _ string, reader io.Reader, _ string, _ int64) error {
@@ -317,7 +265,7 @@ func TestJobService_SaveImgsParallel_ReturnsRepositoryError(t *testing.T) {
 	originKey, currentKey, err := service.SaveImgsParallel(context.Background(), originFile, currentFile)
 
 	require.ErrorIs(t, err, repoErr)
-	assert.Empty(t, originKey)
+	assert.NotEmpty(t, originKey)
 	assert.NotEmpty(t, currentKey)
 	require.Len(t, repo.getSaveImgCalls(), 2)
 }

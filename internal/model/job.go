@@ -4,8 +4,9 @@ type JobStatus string
 
 const (
 	JobStatusCreated JobStatus = "created"
-	JobStatusPending JobStatus = "prending"
+	JobStatusPending JobStatus = "pending"
 	JobStatusDone    JobStatus = "done"
+	JobStatusFailed  JobStatus = "failed"
 )
 
 type Job struct {

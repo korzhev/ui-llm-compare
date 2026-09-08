@@ -15,20 +15,12 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-type IJobRepository interface {
-	GetByID(ctx context.Context, id int) (model.Job, error)
-	CreateNew(ctx context.Context, origiKey string, currentStateKey string) (model.Job, error)
-	SaveImg(ctx context.Context, key string, reader io.Reader, contentType string, size int64) error
-	SendMsg(ctx context.Context, id int, value model.JobKafkaMsg) error
-	Close() error
-}
-
-type IKafkaWriter interface {
+type KafkaWriter interface {
 	WriteMessages(ctx context.Context, msgs ...kafka.Message) error
 	Close() error
 }
 
-type IS3Client interface {
+type S3Client interface {
 	PutObject(
 		ctx context.Context,
 		bucketName string,
@@ -37,13 +29,20 @@ type IS3Client interface {
 		objectSize int64,
 		opts minio.PutObjectOptions,
 	) (minio.UploadInfo, error)
+	RemoveObject(
+		ctx context.Context,
+		bucketName string,
+		objectName string,
+		opts minio.RemoveObjectOptions,
+	) error
 }
 
 type JobRepository struct {
 	DB      *sql.DB
-	S3      IS3Client
+	S3      S3Client
 	Bucket  string
-	KWriter IKafkaWriter
+	KWriter KafkaWriter
+	// S3      minio.Client
 }
 
 func (d *JobRepository) GetByID(ctx context.Context, id int) (model.Job, error) {
@@ -80,6 +79,14 @@ func (d *JobRepository) CreateNew(ctx context.Context, origiKey string, currentS
 	return j, err
 }
 
+func (d *JobRepository) FailJob(ctx context.Context, id int) error {
+	_, err := d.DB.ExecContext(ctx, "UPDATE jobs SET status = 'failed' WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (d *JobRepository) Close() error {
 	return errors.Join(
 		d.KWriter.Close(),
@@ -96,6 +103,15 @@ func (d *JobRepository) SaveImg(ctx context.Context, key string, reader io.Reade
 		minio.PutObjectOptions{
 			ContentType: contentType,
 		},
+	)
+	return err
+}
+
+func (d *JobRepository) DeleteImg(ctx context.Context, key string) error {
+	err := d.S3.RemoveObject(ctx,
+		d.Bucket,
+		key,
+		minio.RemoveObjectOptions{},
 	)
 	return err
 }
