@@ -1,0 +1,27 @@
+{
+    "server_address": ":3000",
+    "db_dsn": "postgres://user:pass@localhost:5432/uillmcompare?sslmode=disable",
+    "log_level": "info",
+    "s3": {
+        "endpoint": "localhost:9000",
+        "access_key_id":"minio",
+        "secret_access_key":"password",
+        "region":"us-east-1",
+        "bucket":"images",
+        "use_ssl":false
+    },
+    "kafka": {
+        "broker": "localhost:9092",
+        "topic": "jobs",
+        "partitions": 1,
+        "replication": 1,
+        "group_id": "ui-llm-worker"
+    },
+    "llm": {
+        "url": "http://127.0.0.1:1234",
+        "model": "qwen/qwen3.8-27b",
+        "token": "sk-lm-*******",
+        "judge_promt": "",
+        "timeout": 60
+    }
+}

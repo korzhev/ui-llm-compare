@@ -21,6 +21,12 @@ type KafkaWriter interface {
 }
 
 type S3Client interface {
+	GetObject(
+		ctx context.Context,
+		bucketName string,
+		objectName string,
+		opts minio.GetObjectOptions,
+	) (*minio.Object, error)
 	PutObject(
 		ctx context.Context,
 		bucketName string,
@@ -87,6 +93,22 @@ func (d *JobRepository) FailJob(ctx context.Context, id int) error {
 	return nil
 }
 
+func (d *JobRepository) StartJob(ctx context.Context, id int) error {
+	_, err := d.DB.ExecContext(ctx, "UPDATE jobs SET status = 'pending' WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (d *JobRepository) SaveJobResult(ctx context.Context, id int, isEqual bool, reason string) error {
+	_, err := d.DB.ExecContext(ctx, "UPDATE jobs SET is_equal = $2, details = $3, status = 'done' WHERE id = $1", id)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (d *JobRepository) Close() error {
 	return errors.Join(
 		d.KWriter.Close(),
@@ -105,6 +127,31 @@ func (d *JobRepository) SaveImg(ctx context.Context, key string, reader io.Reade
 		},
 	)
 	return err
+}
+
+func (d *JobRepository) GetImage(ctx context.Context, key string) (mimeType string, image []byte, err error) {
+	object, err := d.S3.GetObject(ctx, d.Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return "", nil, err
+	}
+	defer func() {
+		closeErr := object.Close()
+		if !errors.Is(closeErr, io.EOF) {
+			err = errors.Join(err, closeErr)
+		}
+	}()
+
+	info, err := object.Stat()
+	if err != nil {
+		return "", nil, err
+	}
+
+	image, err = io.ReadAll(object)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return info.ContentType, image, nil
 }
 
 func (d *JobRepository) DeleteImg(ctx context.Context, key string) error {

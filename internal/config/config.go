@@ -19,6 +19,15 @@ type KafkaConfig struct {
 	Topic             string `json:"topic"`
 	NumPartitions     int    `json:"partitions"`
 	ReplicationFactor int    `json:"replication"`
+	GroupID           string `json:"group_id"`
+}
+
+type LLMConfig struct {
+	URL        string `json:"url"`
+	Model      string `json:"model"`
+	Token      string `json:"token"`
+	JudgePromt string `json:"judge_promt"`
+	Timeout    int    `json:"timeout"`
 }
 
 type Config struct {
@@ -29,8 +38,16 @@ type Config struct {
 	Kafka         KafkaConfig `json:"kafka"`
 }
 
-func ParseConfig(name string) (Config, error) {
-	var c Config
+type WorkerConfig struct {
+	LogLevel string      `json:"log_level"`
+	DBDSN    string      `json:"db_dsn"`
+	S3       S3Config    `json:"s3"`
+	Kafka    KafkaConfig `json:"kafka"`
+	LLM      LLMConfig   `json:"llm"`
+}
+
+func ParseConfig[T any](name string) (T, error) {
+	var c T
 	f, e := os.Open(name)
 	if e != nil {
 		return c, e

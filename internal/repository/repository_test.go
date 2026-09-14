@@ -5,13 +5,18 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/korzhev/ui-llm-compare/internal/model"
 	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/segmentio/kafka-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,7 +35,24 @@ type s3ClientMock struct {
 	opts       minio.PutObjectOptions
 	removeOpts minio.RemoveObjectOptions
 	putErr     error
+	getErr     error
 	removeErr  error
+	client     *minio.Client
+}
+
+func (m *s3ClientMock) GetObject(
+	ctx context.Context,
+	bucketName string,
+	objectName string,
+	opts minio.GetObjectOptions,
+) (*minio.Object, error) {
+	m.bucketName = bucketName
+	m.objectName = objectName
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+
+	return m.client.GetObject(ctx, bucketName, objectName, opts)
 }
 
 func (m *s3ClientMock) PutObject(
@@ -222,6 +244,52 @@ func TestJobRepository_SaveImg_ReturnsS3Error(t *testing.T) {
 	err := repository.SaveImg(context.Background(), "origin.png", strings.NewReader("data"), "image/png", 4)
 
 	require.ErrorIs(t, err, s3Err)
+}
+
+func TestJobRepository_GetImage_ReturnsMIMETypeAndImage(t *testing.T) {
+	const image = "image data"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		w.Header().Set("Content-Length", strconv.Itoa(len(image)))
+		w.Header().Set("Last-Modified", "Mon, 02 Jan 2006 15:04:05 GMT")
+		w.Header().Set("ETag", `"d41d8cd98f00b204e9800998ecf8427e"`)
+		if r.Method == http.MethodGet {
+			_, _ = io.WriteString(w, image)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	serverURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := minio.New(serverURL.Host, &minio.Options{
+		Creds:  credentials.NewStaticV4("access-key", "secret-key", ""),
+		Region: "us-east-1",
+	})
+	require.NoError(t, err)
+	s3 := &s3ClientMock{client: client}
+	repository := &JobRepository{S3: s3, Bucket: "screenshots"}
+
+	mimeType, data, err := repository.GetImage(context.Background(), "jobs/42/origin.png")
+
+	require.NoError(t, err)
+	assert.Equal(t, "image/png", mimeType)
+	assert.Equal(t, []byte(image), data)
+	assert.Equal(t, "screenshots", s3.bucketName)
+	assert.Equal(t, "jobs/42/origin.png", s3.objectName)
+}
+
+func TestJobRepository_GetImage_ReturnsS3Error(t *testing.T) {
+	s3Err := errors.New("s3 get failed")
+	s3 := &s3ClientMock{getErr: s3Err}
+	repository := &JobRepository{S3: s3, Bucket: "screenshots"}
+
+	mimeType, image, err := repository.GetImage(context.Background(), "origin.png")
+
+	require.ErrorIs(t, err, s3Err)
+	assert.Empty(t, mimeType)
+	assert.Nil(t, image)
+	assert.Equal(t, "screenshots", s3.bucketName)
+	assert.Equal(t, "origin.png", s3.objectName)
 }
 
 func TestJobRepository_DeleteImg_DeletesImage(t *testing.T) {

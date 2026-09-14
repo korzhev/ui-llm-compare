@@ -37,7 +37,7 @@ func RootRouter(c config.Config, repo *repository.JobRepository) chi.Router {
 }
 
 func main() {
-	c, err := config.ParseConfig("config.json")
+	c, err := config.ParseConfig[config.Config]("config.json")
 	if err != nil {
 		logger.Log.Errorf("Error starting server: %s\n", err)
 		return

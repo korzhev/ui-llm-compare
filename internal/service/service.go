@@ -16,7 +16,10 @@ type JobRepository interface {
 	SaveImg(ctx context.Context, key string, reader io.Reader, contentType string, size int64) error
 	SendMsg(ctx context.Context, id int, value model.JobKafkaMsg) error
 	FailJob(ctx context.Context, id int) error
+	StartJob(ctx context.Context, id int) error
+	SaveJobResult(ctx context.Context, id int, isEqual bool, reason string) error
 	DeleteImg(ctx context.Context, key string) error
+	GetImage(ctx context.Context, key string) (mimeType string, image []byte, err error)
 }
 
 type JobService struct {

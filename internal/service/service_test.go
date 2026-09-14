@@ -25,12 +25,15 @@ type saveImgCall struct {
 type jobRepositoryMock struct {
 	mu sync.Mutex
 
-	getByIDFn   func(ctx context.Context, id int) (model.Job, error)
-	createNewFn func(ctx context.Context, originKey string, currentStateKey string) (model.Job, error)
-	saveImgFn   func(ctx context.Context, key string, reader io.Reader, contentType string, size int64) error
-	sendMsgFn   func(ctx context.Context, id int, value model.JobKafkaMsg) error
-	failJobFn   func(ctx context.Context, id int) error
-	deleteImgFn func(ctx context.Context, key string) error
+	getByIDFn       func(ctx context.Context, id int) (model.Job, error)
+	createNewFn     func(ctx context.Context, originKey string, currentStateKey string) (model.Job, error)
+	saveImgFn       func(ctx context.Context, key string, reader io.Reader, contentType string, size int64) error
+	sendMsgFn       func(ctx context.Context, id int, value model.JobKafkaMsg) error
+	failJobFn       func(ctx context.Context, id int) error
+	startJobFn      func(ctx context.Context, id int) error
+	saveJobResultFn func(ctx context.Context, id int, isEqual bool, reason string) error
+	deleteImgFn     func(ctx context.Context, key string) error
+	getImageFn      func(ctx context.Context, key string) (mimeType string, image []byte, err error)
 
 	saveImgCalls []saveImgCall
 }
@@ -76,11 +79,32 @@ func (m *jobRepositoryMock) FailJob(ctx context.Context, id int) error {
 	return nil
 }
 
+func (m *jobRepositoryMock) StartJob(ctx context.Context, id int) error {
+	if m.startJobFn != nil {
+		return m.startJobFn(ctx, id)
+	}
+	return nil
+}
+
+func (m *jobRepositoryMock) SaveJobResult(ctx context.Context, id int, isEqual bool, reason string) error {
+	if m.saveJobResultFn != nil {
+		return m.saveJobResultFn(ctx, id, isEqual, reason)
+	}
+	return nil
+}
+
 func (m *jobRepositoryMock) DeleteImg(ctx context.Context, key string) error {
 	if m.deleteImgFn != nil {
 		return m.deleteImgFn(ctx, key)
 	}
 	return nil
+}
+
+func (m *jobRepositoryMock) GetImage(ctx context.Context, key string) (string, []byte, error) {
+	if m.getImageFn != nil {
+		return m.getImageFn(ctx, key)
+	}
+	return "", nil, nil
 }
 
 func (m *jobRepositoryMock) Close() error {
