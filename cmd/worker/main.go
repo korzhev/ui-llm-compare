@@ -59,7 +59,7 @@ func main() {
 				}
 				logger.Log.Infof("Msg(%v): %v", i, msg)
 				if err := s.ProcessMsg(ctx, msg); err != nil {
-					logger.Log.Errorf("Error processing msg: %v\n", err)
+					logger.Log.Errorf("Error processing msg(%v): %v\n", i, err)
 				}
 			}
 		}(i)
