@@ -67,10 +67,11 @@ func TestLLMRepository_FormatLLMRequest_FormatsJSON(t *testing.T) {
 	repository := LLMRepository{llmConf: config.LLMConfig{
 		Model:      "vision-model",
 		JudgePromt: "Compare the screenshots",
+		Promt:      "Focus on the header",
 	}}
 
 	data, err := repository.FormatLLMRequest(
-		"Focus on the header",
+		"ignored runtime prompt",
 		"image/png",
 		"image/jpeg",
 		"b3JpZ2lu",
