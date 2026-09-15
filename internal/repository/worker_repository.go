@@ -34,7 +34,7 @@ func (c LLMRepository) FormatLLMRequest(promt, mimeTypeOrigin, mimeType, base64I
 				},
 				model.LLMTextContent{
 					Type: "user",
-					Text: promt,
+					Text: c.llmConf.Promt,
 				},
 				model.LLMImgContent{
 					Type: "image_url",

@@ -26,8 +26,9 @@ type LLMConfig struct {
 	URL        string `json:"url"`
 	Model      string `json:"model"`
 	Token      string `json:"token"`
-	JudgePromt string `json:"judge_promt"`
+	JudgePromt string `json:"system_promt"`
 	Timeout    int    `json:"timeout"`
+	Promt      string `json:"promt"`
 }
 
 type Config struct {
