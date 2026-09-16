@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS jobs;
+DROP TYPE job_status;
